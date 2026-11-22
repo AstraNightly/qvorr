@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>qvorr</title>
+<style>
+  html,body{margin:0;height:100%;background:#06070b;overflow:hidden}
+  canvas{display:block;width:100vw;height:100vh}
+  #hud{position:fixed;left:14px;bottom:12px;color:#8b93a7;
+       font:11px/1.6 ui-monospace,Menlo,monospace;letter-spacing:.04em;
+       user-select:none;pointer-events:none;white-space:pre}
+  #hud b{color:#7ef0c0;font-weight:normal}
+  #name{position:fixed;top:12px;left:14px;color:#c9cede;
+        font:12px ui-monospace,Menlo,monospace;letter-spacing:.35em;
+        user-select:none;pointer-events:none}
+  #err{position:fixed;inset:0;color:#c9cede;display:none;
+       align-items:center;justify-content:center;
+       font:13px ui-monospace,Menlo,monospace;text-align:center}
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="name">QVORR</div>
+<div id="hud"></div>
+<div id="err"></div>
+<script>
+"use strict";
+/* qvorr — a wandering through the inside of a seed.
+   one file, no deps: the whole world is the fragment shader below. */
+
+const vs = `#version 300 es
+in vec2 p; void main(){ gl_Position = vec4(p,0.,1.); }`;
+
+const fs = `#version 300 es
+precision highp float;
+uniform vec2  R;      /* viewport            */
+uniform float T;      /* seconds since start */
+uniform vec2  M;      /* orbit angles        */
+uniform float Z;      /* zoom                */
+out vec4 O;
+
+/* ---- sdf: mandelbulb, degree 8 ------------------------------------ */
+float bulb(vec3 q){
+  vec3 z = q; float dr = 1.; float r = 0.;
+  float trap = 1e9;
+  for(int i=0;i<7;i++){
+    r = length(z);
+    if(r > 2.0) break;
+    float th = acos(clamp(z.z/r,-1.,1.));
+    float ph = atan(z.y, z.x);
+    float r7 = pow(r,7.);
+    float r8 = r7*r;
+    dr = 7.*r7*dr + 1.;
+    th *= 7.; ph *= 7.;
+    z = q + r8*vec3(sin(th)*cos(ph), sin(ph)*sin(th), cos(th));
+    trap = min(trap, r);
+  }
+  return 0.25*log(r)*r/dr;   /* distance estimate */
+}
+
+mat3 view(vec2 a){
+  float ca=cos(a.x), sa=sin(a.x), cb=cos(a.y), sb=sin(a.y);
+  return mat3(cb,0.,-sb, 0.,1.,0., sb,0.,cb) * mat3(1.,0.,0., 0.,ca,sa, 0.,-sa,ca);
+}
+
+void main(){
+  vec2 uv = (2.*gl_FragCoord.xy - R) / R.y;
+  mat3 V = view(M);
+  vec3 ro = V * vec3(0., 0., -2.6*Z);
+  vec3 rd = normalize(V * vec3(uv, 1.6));
+
+  float t = 0.; float d; int steps = 0; bool hit = false;
+  for(int i=0;i<128;i++){
+    vec3 p = ro + rd*t;
+    d = bulb(p);
+    if(d < 0.0004*max(t,1.)){ hit = true; break; }
+    if(t > 6.) break;
+    t += d*0.85; steps++;
+  }
+
+  vec3 col = vec3(0.);
+  if(hit){
+    vec3 p = ro + rd*t;
+    /* cheap normal by tetrahedron taps */
+    float e = 0.0006;
+    vec2 k = vec2(1.,-1.);
+    vec3 n = normalize( k.xyy*bulb(p+k.xyy*e)+k.yyx*bulb(p+k.yyx*e)
+                       +k.yxy*bulb(p+k.yxy*e)+k.xxx*bulb(p+k.xxx*e) );
+
+    /* two hard lights + a rim */
+    vec3 L1 = normalize(vec3(.7,.8,-.4));
+    vec3 L2 = normalize(vec3(-.6,-.3,.5));
+    float dif = max(dot(n,L1),0.);
+    float bak = max(dot(n,L2),0.);
+    float rim = pow(1.-max(dot(n,-rd),0.), 3.);
+    float ao  = 1. - float(steps)/128.;   /* crowded rays = deep folds */
+
+    col = vec3(.015,.02,.035);
+    col += dif*vec3(.5,.55,.7)*.55;
+    col += bak*vec3(.22,.09,.38);
+    col += rim*vec3(.1,.5,.38);
+    col *= .35 + .65*ao;
+  }
+
+  /* starfield behind everything */
+  if(!hit){
+    vec2 s = uv*90.;
+    vec2 cell = floor(s);
+    float h = fract(sin(dot(cell, vec2(12.9898,78.233)))*43758.5453);
+    vec2 f = fract(s)-.5;
+    float star = smoothstep(.06,.0,length(f)) * step(.997,h)
+               * (0.5+0.5*sin(T*2.+h*40.));
+    col += star*vec3(.7,.95,.85);
+  }
+
+  /* fog + vignette + a slow drift of exposure, like breathing */
+  col = mix(col, vec3(.024,.027,.043), 1.-exp(-.12*t*t));
+  col *= 1. - .35*dot(uv,uv);
+  col *= .92 + .08*sin(T*.4);
+  O = vec4(pow(col, vec3(.4545)), 1.);
+}`;
+
+const cv = document.getElementById("gl");
+const gl = cv.getContext("webgl2", {antialias:false});
+const err = document.getElementById("err");
+if(!gl){ err.style.display="flex"; err.textContent = "no webgl2 here. the seed stays closed."; }
+
+function sh(type, src){
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+let U = {}, t0 = performance.now(), frames = 0, fps = 0, fpsT = t0;
+const M = {x:-.6, y:.3}, Z = {v:1};
+let drag = null;
+
+function boot(){
+  const prog = gl.createProgram();
+  gl.attachShader(prog, sh(gl.VERTEX_SHADER, vs));
+  gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(prog);
+  if(!gl.getProgramParameter(prog, gl.LINK_STATUS))
+    throw new Error(gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(prog, "p");
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  for(const n of ["R","T","M","Z"]) U[n] = gl.getUniformLocation(prog, n);
+
+  cv.onpointerdown = e => { drag = {x:e.clientX, y:e.clientY}; cv.setPointerCapture(e.pointerId); };
+  cv.onpointermove = e => {
+    if(!drag) return;
+    M.x += (e.clientX - drag.x)*0.004;
+    M.y += (e.clientY - drag.y)*0.004;
+    M.y = Math.max(-1.4, Math.min(1.4, M.y));
+    drag = {x:e.clientX, y:e.clientY};
+  };
+  cv.onpointerup = () => drag = null;
+  cv.onwheel = e => { e.preventDefault(); Z.v = Math.max(.35, Math.min(3.2, Z.v * (e.deltaY>0 ? 1.08 : .926))); };
+  addEventListener("resize", fit); fit();
+  requestAnimationFrame(frame);
+}
+
+function fit(){
+  const d = Math.min(devicePixelRatio||1, 2);
+  cv.width  = Math.floor(innerWidth *d);
+  cv.height = Math.floor(innerHeight*d);
+  gl.viewport(0,0,cv.width,cv.height);
+}
+
+const hud = document.getElementById("hud");
+function frame(now){
+  const t = (now - t0)/1000;
+  if(!drag) M.x += 0.00035;                    /* lazy drift when idle */
+  gl.uniform2f(U.R, cv.width, cv.height);
+  gl.uniform1f(U.T, t);
+  gl.uniform2f(U.M, M.x, M.y);
+  gl.uniform1f(U.Z, Z.v);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  frames++;
+  if(now - fpsT > 500){
+    fps = Math.round(frames*1000/(now - fpsT));
+    frames = 0; fpsT = now;
+    hud.textContent =   /* fully generated above, no untrusted content */
+      "seed 8 · iter 7 · eps 4e-4\n" +
+      "orbit " + M.x.toFixed(2) + " / " + M.y.toFixed(2) +
+      "   zoom " + Z.v.toFixed(2) +
+      "   " + cv.width + "×" + cv.height + " @" + fps + "fps\n" +
+      "drag to look · wheel to fall in";
+  }
+  requestAnimationFrame(frame);
+}
+window.addEventListener("error", ev => {
+  err.style.display="flex";
+  err.textContent = "cracked open: " + ev.message;
+});
+if(gl) boot();
+</script>
+</body>
+</html>
